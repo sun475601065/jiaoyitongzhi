@@ -1,0 +1,6 @@
+# 国内期货趋势回调策略 - 依赖清单
+# 安装: pip install -r requirements.txt
+# 说明: 行情数据源为 akshare(新浪财经), 具体主力合约 + 连续合约(趋势确认/备用)
+akshare>=1.14.0
+pandas>=1.5.0
+numpy>=1.23.0
