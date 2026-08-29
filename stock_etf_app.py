@@ -8,7 +8,10 @@
  页面功能：
    · 侧边栏：账户总权益、单笔风险比例、是否启用持仓录入
    · 主区域：点击「运行策略扫描」后才开始获取数据与计算（页面加载不自动运行）
-   · 结果：股票池信息 / 趋势资格标的列表 / 新开仓信号表 / 持仓监控 / 次日条件单 / 数据获取统计
+   · 结果：股票池信息 / 趋势资格标的列表 / 新开仓信号表 / 持仓监控 / 资金占用与总仓位 / 次日条件单 / 数据获取统计
+ 资金管理硬约束：
+   · 单品种买入金额 ≤ 账户权益×20%（建议股数 = min(风险股数, 单品种上限股数)，向下取整到100股）
+   · 总持仓买入金额红线 = 账户权益×30%（考虑T+1隔夜风险），超限红色警告"请减少持仓"
  股票池：全部中证A500成分股（约500只，不做成交额过滤）+ 手动配置14只行业ETF
 ================================================================================
  部署方法（Streamlit Cloud）：
@@ -71,6 +74,11 @@ ETF_STOP_PCT = 0.03                   # ETF默认百分比止损 3%（3%-5%区�
 STOP_PCT_OVERRIDE = {}                # 各品种单独配置止损比例，如 {"600519": 0.04, "159928": 0.035}
 BE_BUFFER = 0.0015                    # 保本缓冲 0.15%
 BE_ARM_MULT = 1.0                     # 浮盈达 1×止损幅度 后启用保本
+
+# ---- 资金管理硬约束（新增） ----
+POS_AMOUNT_CAP_PCT = 0.20    # 硬约束1：单品种买入金额上限 = 账户权益×20%
+TOTAL_AMOUNT_CAP_PCT = 0.30  # 硬约束2：总持仓买入金额红线 = 账户权益×30%（考虑T+1隔夜风险，超限警告）
+
 RISK_PCT = 0.02                       # 温和趋势：单笔风险占权益 2%（运行时可由侧边栏覆盖）
 RISK_PCT_STRONG = 0.01                # 强趋势：半仓，单笔风险 1%
 SIGNAL_VALID_DAYS = 5                 # 入场信号有效期5天（信号日=第1天）
@@ -484,7 +492,13 @@ def classify_trend_long(df):
 
 
 def scan_signals_long(df, equity, stop_pct):
-    """扫描最近 SIGNAL_LOOKBACK 个交易日的做多信号，返回信号字典列表"""
+    """
+    扫描最近 SIGNAL_LOOKBACK 个交易日的做多信号，返回信号字典列表。
+    股数计算（资金管理硬约束）：
+      风险股数   = 权益×风险比例 ÷ (现价×止损%)，向下取整到100股
+      单品种上限股数 = 权益×20% ÷ 现价，向下取整到100股（买入金额≤权益×20%）
+      建议股数   = min(风险股数, 单品种上限股数)
+    """
     n = len(df)
     signals = []
     if n < DATA_MIN_BARS:
@@ -519,14 +533,26 @@ def scan_signals_long(df, equity, stop_pct):
             stop = entry * (1 - stop_pct)
             risk_pct = RISK_PCT_STRONG if strong else RISK_PCT
             per_share_risk = entry * stop_pct
-            shares = int(equity * risk_pct / per_share_risk) if per_share_risk > 0 else 0
-            shares = shares // 100 * 100              # 向下取整到100股
+            shares_risk = int(equity * risk_pct / per_share_risk) if per_share_risk > 0 else 0
+            shares_risk = shares_risk // 100 * 100              # 风险股数：向下取整到100股
+            # 硬约束1：单品种资金上限 —— 买入金额 ≤ 账户权益×20%
+            #          上限股数 = 权益×20% ÷ 现价，向下取整到100股
+            shares_cap = int(equity * POS_AMOUNT_CAP_PCT / entry) // 100 * 100
+            # 硬约束3：建议股数 = min(风险股数, 单品种上限股数)
+            shares = min(shares_risk, shares_cap)
+            buy_amount = shares * entry
             signals.append({
                 "strong": strong, "signal_day": dates.iloc[t],
                 "status": "已确认", "confirm_day": dates.iloc[confirm],
                 "day_no": confirm - t + 1,
                 "entry": entry, "stop": stop, "shares": shares,
                 "risk_amt": shares * per_share_risk,
+                # 资金管理硬约束相关字段
+                "shares_risk": shares_risk,
+                "shares_cap": shares_cap,
+                "buy_amount": buy_amount,
+                "amount_pct": (buy_amount / equity) if equity > 0 else 0.0,
+                "capped": shares_cap < shares_risk,
             })
         else:
             status = "待确认" if t + SIGNAL_VALID_DAYS - 1 >= n - 1 else "已失效"
@@ -534,6 +560,8 @@ def scan_signals_long(df, equity, stop_pct):
                 "strong": strong, "signal_day": dates.iloc[t],
                 "status": status, "day_no": n - t,
                 "entry": None, "stop": None, "shares": 0, "risk_amt": 0.0,
+                "shares_risk": 0, "shares_cap": 0,
+                "buy_amount": 0.0, "amount_pct": 0.0, "capped": False,
             })
     return signals
 
@@ -705,7 +733,7 @@ def nextday_orders_stock(pos, res):
     return L
 
 
-def format_position_block_stock(p, res):
+def format_position_block_stock(p, res, equity=None):
     """把单个持仓的监控结果格式化为多行文本（用于 st.markdown 展示）"""
     L = []
     L.append("#### 【%s %s】开仓 %s × %d 股，%s，止损 %.1f%%"
@@ -729,6 +757,14 @@ def format_position_block_stock(p, res):
                     "已生效" if res["be_armed"] else "未生效"))
     for ev in res.get("events", []):
         L.append("  · %s" % ev)
+    # ---- 资金管理硬约束展示：单品种买入金额及占比 / 20%上限 ----
+    if equity and equity > 0:
+        buy_amt = p["price"] * p["shares"]
+        a_pct = buy_amt / equity * 100.0
+        L.append("- 单品种买入金额：%s 元（占权益 %.1f%%；单品种上限=权益×20%%=%s 元）"
+                 % (fmt(buy_amt, 0), a_pct, fmt(equity * POS_AMOUNT_CAP_PCT, 0)))
+        if buy_amt > equity * POS_AMOUNT_CAP_PCT:
+            L.append("- ⚠️ 该品种买入金额已触及单品种20%%上限（%.1f%% > 20%%）" % a_pct)
     # 结论行
     if res["status"].startswith("已离场"):
         L.append("**结论：平仓离场（触发原因：%s）**" % res["exit_reason"])
@@ -756,6 +792,14 @@ def build_orders_text_stock(pos_pairs):
     if open_cnt == 0:
         L.append("无持有中的持仓，无需条件单。")
     return "\n".join(L)
+
+
+def calc_total_amount(pos_pairs):
+    """硬约束2：总仓位 —— 所有持仓的买入金额之和（考虑T+1隔夜风险）"""
+    total = 0.0
+    for p, _ in pos_pairs:
+        total += p["price"] * p["shares"]
+    return total
 
 
 def parse_date_text(s):
@@ -884,6 +928,10 @@ def render_app():
                 },
             )
         st.divider()
+        st.caption("资金管理硬约束：单品种买入金额 ≤ 权益×20%%（当前上限 %.0f 元）；"
+                   "总持仓买入金额红线 = 权益×30%%（当前红线 %.0f 元，考虑T+1隔夜风险），"
+                   "超限将在报告中红色警告。"
+                   % (equity * POS_AMOUNT_CAP_PCT, equity * TOTAL_AMOUNT_CAP_PCT))
         st.caption("点击主区域的「运行策略扫描」按钮开始获取数据与计算；"
                    "页面加载时不会自动运行。扫描全部A500成分股，预计耗时3-5分钟。")
 
@@ -1056,6 +1104,10 @@ def render_app():
         for sig in r["sigs"]:
             if sig["status"] == "已确认":
                 remark = "信号后第%d天收盘站上EMA25确认" % sig["day_no"]
+                # 资金管理硬约束提示：建议股数被单品种20%资金上限约束时注明
+                if sig.get("capped"):
+                    remark += "；受单品种20%%资金上限约束（风险%d股→上限%d股）" % (
+                        sig.get("shares_risk", 0), sig.get("shares_cap", 0))
             elif sig["status"] == "待确认":
                 remark = "窗口第%d天，等待收盘站上EMA25" % sig["day_no"]
             else:
@@ -1072,6 +1124,8 @@ def render_app():
                 "止损%": "%.1f%%" % (r["stop_pct"] * 100),
                 "建议股数": fmt(sig["shares"], 0) if sig["shares"] > 0 else "资金不足",
                 "风险金额": fmt(sig["risk_amt"], 0),
+                "买入金额": fmt(sig.get("buy_amount"), 0),
+                "单品种占比": "%.1f%%" % (sig.get("amount_pct", 0.0) * 100),
                 "备注": remark,
             })
     rows.sort(key=lambda x: x["信号日"])
@@ -1085,15 +1139,38 @@ def render_app():
     if not pos_pairs:
         st.write("当前无持仓录入。")
     for p, res in pos_pairs:
-        st.markdown(format_position_block_stock(p, res))
+        st.markdown(format_position_block_stock(p, res, equity))
+        # 单品种20%上限：超限用红色警告
+        buy_amt = p["price"] * p["shares"]
+        if equity > 0 and buy_amt > equity * POS_AMOUNT_CAP_PCT:
+            st.error("⚠️ %s 单品种买入金额 %.1f%%，已触及单品种20%%上限"
+                     % (p["name"], buy_amt / equity * 100))
+
+    # 资金占用与总仓位（硬约束汇总）
+    st.subheader("五、资金占用与总仓位（硬约束）")
+    total_amount = calc_total_amount(pos_pairs)
+    total_pct = total_amount / equity * 100.0 if equity > 0 else 0.0
+    c1, c2, c3 = st.columns(3)
+    c1.metric("单品种买入上限（权益×20%）", "%s 元" % fmt(equity * POS_AMOUNT_CAP_PCT, 0))
+    c2.metric("总仓位红线（权益×30%）", "%s 元" % fmt(equity * TOTAL_AMOUNT_CAP_PCT, 0))
+    c3.metric("总持仓买入金额", "%s 元" % fmt(total_amount, 0), "占权益 %.1f%%" % total_pct)
+    if pos_pairs and total_amount > equity * TOTAL_AMOUNT_CAP_PCT:
+        # 硬约束2：总仓位超30%红线（T+1隔夜风险）→ 红色警告
+        st.error("⚠️ 总持仓买入金额 %s 元，占总权益 %.1f%%，已超过30%%红线，请减少持仓"
+                 % (fmt(total_amount, 0), total_pct))
+    elif pos_pairs:
+        st.success("总持仓买入金额 %s 元，占总权益 %.1f%%，处于30%%红线以内"
+                   % (fmt(total_amount, 0), total_pct))
+    else:
+        st.write("当前无持仓，无总仓位占用。")
 
     # 次日条件单（可复制文本）
-    st.subheader("五、次日条件单（可复制）")
+    st.subheader("六、次日条件单（可复制）")
     st.text_area("次日条件单文本", value=build_orders_text_stock(pos_pairs),
                  height=240, label_visibility="collapsed")
 
     # 数据获取统计
-    st.subheader("六、数据获取统计")
+    st.subheader("七、数据获取统计")
     ok_cnt = sum(1 for item in pool if item["code"] in prepared)
     st.markdown(
         "**数据源**：新浪优先（股票 stock_zh_a_daily 前复权qfq；ETF fund_etf_hist_sina 不复权），"

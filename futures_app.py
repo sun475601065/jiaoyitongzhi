@@ -8,7 +8,10 @@
  页面功能：
    · 侧边栏：账户总权益、单笔风险比例、是否手动设置保证金、是否启用持仓录入
    · 主区域：点击「运行策略扫描」后才开始获取数据与计算（页面加载不自动运行）
-   · 结果：趋势资格品种列表 / 新开仓信号表 / 持仓监控 / 次日条件单 / 数据获取统计
+   · 结果：趋势资格品种列表 / 新开仓信号表 / 持仓监控 / 资金占用与隔夜风险 / 次日条件单 / 数据获取统计
+ 资金管理硬约束：
+   · 单品种保证金占用 ≤ 账户权益×20%（建议手数 = min(风险手数, 保证金上限手数)）
+   · 总隔夜保证金占用红线 = 账户权益×30%，超限红色警告"请减少持仓"
 ================================================================================
  部署方法（Streamlit Cloud）：
    1. 将本文件与 requirements.txt 上传到 GitHub 仓库；
@@ -125,6 +128,10 @@ AUTO_REFRESH_MAIN = True   # 启动时自动识别最新主力合约（失败则
 
 # ---- 保证金 ----
 EXTRA_MARGIN = 0.03        # 期货公司加收保证金比例：实际保证金 = 交易所比例 + 3%
+
+# ---- 资金管理硬约束（新增） ----
+POS_MARGIN_CAP_PCT = 0.20    # 硬约束1：单品种保证金占用上限 = 账户权益×20%
+TOTAL_MARGIN_CAP_PCT = 0.30  # 硬约束2：总隔夜保证金占用红线 = 账户权益×30%（超限警告）
 
 # ---- 指标与策略参数（与命令行版一致） ----
 EMA_FAST, EMA_MID, EMA_SLOW = 25, 50, 144      # 均线周期
@@ -503,8 +510,16 @@ def merge_trend(main_df, cont_df):
 # =============================================================================
 
 
-def scan_signals(df, equity, multiplier):
-    """扫描最近 SIGNAL_LOOKBACK 个交易日的入场信号，返回信号字典列表"""
+def scan_signals(df, equity, multiplier, margin_ratio=None):
+    """
+    扫描最近 SIGNAL_LOOKBACK 个交易日的入场信号，返回信号字典列表。
+    margin_ratio：实际保证金比例（交易所比例 + EXTRA_MARGIN），用于单品种保证金约束；
+                  为 None 时不启用保证金约束（仅按风险手数）。
+    手数计算（资金管理硬约束）：
+      风险手数   = 权益×风险比例 ÷ (2×ATR×乘数)
+      保证金上限手数 = 权益×20% ÷ (入场价×乘数×实际保证金比例)，向下取整
+      建议手数   = min(风险手数, 保证金上限手数)
+    """
     n = len(df)
     signals = []
     if n < DATA_MIN_BARS:
@@ -556,7 +571,15 @@ def scan_signals(df, equity, multiplier):
                 else entry + STOP_ATR_MULT * entry_atr
             risk_pct = RISK_PCT_STRONG if strong else RISK_PCT
             per_lot_risk = STOP_ATR_MULT * entry_atr * multiplier
-            lots = int(equity * risk_pct / per_lot_risk) if per_lot_risk > 0 else 0
+            lots_risk = int(equity * risk_pct / per_lot_risk) if per_lot_risk > 0 else 0
+            # 硬约束1：单品种保证金约束 —— 每手保证金 = 现价×合约乘数×实际保证金比例
+            #          最大可开仓手数（按保证金）= 账户权益×20% ÷ 每手保证金，向下取整
+            margin_ratio = margin_ratio if margin_ratio and margin_ratio > 0 else 0.0
+            margin_per_lot = entry * multiplier * margin_ratio
+            lots_margin = int(equity * POS_MARGIN_CAP_PCT / margin_per_lot) \
+                if margin_per_lot > 0 else 0
+            # 硬约束3：建议手数 = min(风险手数, 保证金上限手数)
+            lots = min(lots_risk, lots_margin)
             signals.append({
                 "dir": tdir[t], "strong": strong,
                 "signal_day": dates.iloc[t], "signal_idx": t,
@@ -564,6 +587,13 @@ def scan_signals(df, equity, multiplier):
                 "day_no": confirm - t + 1,
                 "entry": entry, "stop": stop, "atr": entry_atr,
                 "lots": lots, "risk_amt": lots * per_lot_risk,
+                # 资金管理硬约束相关字段
+                "lots_risk": lots_risk,
+                "lots_margin": lots_margin,
+                "margin_per_lot": margin_per_lot,
+                "margin_amt": lots * margin_per_lot,
+                "margin_pct": (lots * margin_per_lot / equity) if equity > 0 else 0.0,
+                "margin_capped": lots_margin < lots_risk,
             })
         else:
             # 窗口未走完 → 待确认；窗口已过 → 已失效
@@ -574,6 +604,9 @@ def scan_signals(df, equity, multiplier):
                 "status": status, "day_no": n - t,
                 "entry": None, "stop": None, "atr": None,
                 "lots": 0, "risk_amt": 0.0,
+                "lots_risk": 0, "lots_margin": 0,
+                "margin_per_lot": 0.0, "margin_amt": 0.0,
+                "margin_pct": 0.0, "margin_capped": False,
             })
     return signals
 
@@ -946,7 +979,7 @@ def nextday_orders(p, res):
     return L
 
 
-def format_position_block(p, res):
+def format_position_block(p, res, equity=None):
     """把单个持仓的监控结果格式化为多行文本（用于 st.markdown 展示）"""
     L = []
     d = "多" if p["direction"] == 1 else "空"
@@ -979,6 +1012,13 @@ def format_position_block(p, res):
         L.append("- SAR接管：%s" % ("已接管" if res["sar_active"] else "未接管"))
     for ev in res.get("events", []):
         L.append("  · %s" % ev)
+    # ---- 资金管理硬约束展示：单品种保证金占用及占比 / 20%红线 ----
+    if equity and equity > 0:
+        m_pct = margin_amt / equity * 100.0
+        L.append("- 单品种保证金占用：%s 元（占权益 %.1f%%；单品种上限=权益×20%%=%s 元）"
+                 % (fmt(margin_amt, 0), m_pct, fmt(equity * POS_MARGIN_CAP_PCT, 0)))
+        if margin_amt > equity * POS_MARGIN_CAP_PCT:
+            L.append("- ⚠️ 该品种保证金占用已触及单品种20%%红线（%.1f%% > 20%%）" % m_pct)
     # 结论行
     if res["status"].startswith("已离场"):
         L.append("**结论：平仓离场（触发原因：%s）**" % res["exit_reason"])
@@ -1006,6 +1046,14 @@ def build_orders_text(pos_pairs):
     if open_cnt == 0:
         L.append("无持有中的持仓，无需条件单。")
     return "\n".join(L)
+
+
+def calc_total_margin(pos_pairs):
+    """硬约束2：总隔夜风险度 —— 所有持仓的保证金占用之和（Σ 每手保证金×手数）"""
+    total = 0.0
+    for p, _ in pos_pairs:
+        total += p["price"] * p["multiplier"] * p["lots"] * p["margin"]
+    return total
 
 
 def find_contract(contracts, s):
@@ -1163,6 +1211,9 @@ def render_app():
                 },
             )
         st.divider()
+        st.caption("资金管理硬约束：单品种保证金占用 ≤ 权益×20%%（当前上限 %.0f 元）；"
+                   "总隔夜保证金占用红线 = 权益×30%%（当前红线 %.0f 元），超限将在报告中红色警告。"
+                   % (equity * POS_MARGIN_CAP_PCT, equity * TOTAL_MARGIN_CAP_PCT))
         st.caption("点击主区域的「运行策略扫描」按钮开始获取数据与计算；"
                    "页面加载时不会自动运行。")
 
@@ -1287,7 +1338,7 @@ def render_app():
         df = main_dfs.get(c["code"])
         if df is None or len(df) < DATA_MIN_BARS:
             continue
-        sigs = scan_signals(df, equity, c["mult"])
+        sigs = scan_signals(df, equity, c["mult"], c["margin_actual"])
         sigs = filter_recent_signals(sigs, df)
         if sigs:
             signals[c["code"]] = sigs
@@ -1334,6 +1385,10 @@ def render_app():
             if sig["status"] == "已确认":
                 remark = "信号后第%d天收盘确认%sEMA25" % (
                     sig["day_no"], "站上" if sig["dir"] == 1 else "跌破")
+                # 资金管理硬约束提示：建议手数被单品种保证金上限约束时注明
+                if sig.get("margin_capped"):
+                    remark += "；受单品种20%%保证金约束（风险%d手→上限%d手）" % (
+                        sig.get("lots_risk", 0), sig.get("lots_margin", 0))
             elif sig["status"] == "待确认":
                 remark = "窗口第%d天，等待收盘%sEMA25" % (
                     sig["day_no"], "站上" if sig["dir"] == 1 else "跌破")
@@ -1350,6 +1405,8 @@ def render_app():
                 "ATR": fmt(sig["atr"]),
                 "手数": fmt(sig["lots"], 0) if sig["lots"] > 0 else "资金不足",
                 "风险金额": fmt(sig["risk_amt"], 0),
+                "保证金占用": fmt(sig.get("margin_amt"), 0),
+                "单品种占比": "%.1f%%" % (sig.get("margin_pct", 0.0) * 100),
                 "备注": remark,
             })
     rows.sort(key=lambda r: r["信号日"])
@@ -1363,15 +1420,38 @@ def render_app():
     if not pos_pairs:
         st.write("当前无持仓录入。")
     for p, res in pos_pairs:
-        st.markdown(format_position_block(p, res))
+        st.markdown(format_position_block(p, res, equity))
+        # 单品种20%红线：超限用红色警告
+        m_amt = p["price"] * p["multiplier"] * p["lots"] * p["margin"]
+        if equity > 0 and m_amt > equity * POS_MARGIN_CAP_PCT:
+            st.error("⚠️ %s 单品种保证金占用 %.1f%%，已触及单品种20%%红线"
+                     % (p["name"], m_amt / equity * 100))
+
+    # 资金占用与隔夜风险（硬约束汇总）
+    st.subheader("四、资金占用与隔夜风险（硬约束）")
+    total_margin = calc_total_margin(pos_pairs)
+    total_pct = total_margin / equity * 100.0 if equity > 0 else 0.0
+    c1, c2, c3 = st.columns(3)
+    c1.metric("单品种保证金上限（权益×20%）", "%s 元" % fmt(equity * POS_MARGIN_CAP_PCT, 0))
+    c2.metric("总隔夜红线（权益×30%）", "%s 元" % fmt(equity * TOTAL_MARGIN_CAP_PCT, 0))
+    c3.metric("总保证金占用", "%s 元" % fmt(total_margin, 0), "占权益 %.1f%%" % total_pct)
+    if pos_pairs and total_margin > equity * TOTAL_MARGIN_CAP_PCT:
+        # 硬约束2：总隔夜风险度超30%红线 → 红色警告
+        st.error("⚠️ 总保证金占用 %s 元，占总权益 %.1f%%，已超过30%%红线，请减少持仓"
+                 % (fmt(total_margin, 0), total_pct))
+    elif pos_pairs:
+        st.success("总保证金占用 %s 元，占总权益 %.1f%%，处于30%%红线以内"
+                   % (fmt(total_margin, 0), total_pct))
+    else:
+        st.write("当前无持仓，无隔夜保证金占用。")
 
     # 次日条件单（可复制文本）
-    st.subheader("四、次日条件单（可复制）")
+    st.subheader("五、次日条件单（可复制）")
     st.text_area("次日条件单文本", value=build_orders_text(pos_pairs),
                  height=280, label_visibility="collapsed")
 
     # 数据获取统计
-    st.subheader("五、数据获取统计")
+    st.subheader("六、数据获取统计")
     cont_ok = sum(1 for c in contracts
                   if cont_dfs.get(c["code"]) is not None and len(cont_dfs[c["code"]]) >= DATA_MIN_BARS)
     main_ok = len(main_dfs)
