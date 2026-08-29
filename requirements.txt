@@ -1,8 +1,7 @@
-# 国内期货趋势回调策略 - 依赖清单
-# 安装: pip install -r requirements.txt
-# 说明: 行情数据源为 akshare(新浪财经), 具体主力合约 + 连续合约(趋势确认/备用)
-#       app.py 为 Streamlit 网页版, 需要 streamlit
-akshare>=1.14.0
-pandas>=1.5.0
-numpy>=1.23.0
-streamlit>=1.30.0
+# Streamlit 部署依赖（Streamlit Cloud 会自动安装）
+# 说明：akshare 会自动拉取其自身依赖（pandas/numpy 等），
+#       这里显式列出核心依赖以保证版本兼容。
+streamlit
+akshare
+pandas
+numpy
