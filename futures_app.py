@@ -126,6 +126,18 @@ CONTRACTS = [
 
 AUTO_REFRESH_MAIN = True   # 启动时自动识别最新主力合约（失败则用备用代码）
 
+# ---- 多品种开仓推荐：关联组配置（同一组内只推荐排序最靠前的一个品种） ----
+RISK_GROUPS_FUTURES = {
+    "黑色系":   ["RB", "HC", "I", "J", "JM", "SF", "SM"],
+    "化工系":   ["MA", "PP", "L", "V", "EG", "EB"],
+    "油脂油料": ["Y", "P", "OI", "M", "RM", "A", "B"],
+    "有色系":   ["CU", "AL", "ZN", "NI", "SN"],
+    "玉米链":   ["C", "CS", "RR"],
+    "软商品":   ["CF", "CY", "SR"],
+    "生鲜畜牧": ["JD", "LH", "AP", "CJ", "PK"],
+    "橡胶系":   ["RU", "NR", "SP"],
+}
+
 # ---- 保证金 ----
 EXTRA_MARGIN = 0.03        # 期货公司加收保证金比例：实际保证金 = 交易所比例 + 3%
 
@@ -633,6 +645,93 @@ def filter_recent_signals(sigs, df):
                 continue               # 确认日过早的已确认信号丢弃
         out.append(s)
     return out
+
+
+# =============================================================================
+# 多品种开仓推荐（只影响展示，不改变任何交易逻辑）
+# =============================================================================
+
+
+def build_recommendations_futures(signals, contracts, equity, positions=None):
+    """
+    今日开仓推荐（多品种同时满足开仓条件时的排序与过滤）：
+      排序：① 强趋势信号 > 温和趋势信号
+            ② 已确认信号 > 待确认信号
+            ③ 信号日更早 > 信号日更晚
+      过滤：④ 关联组去重：同一关联组内只推荐排序最靠前的一个品种
+            ⑤ 资金约束：单品种保证金 ≤ 权益×20%；总保证金 ≤ 权益×30%（含已有持仓）；
+               单笔风险 ≤ 权益×2%；资金不足开1手时跳过
+      说明：待确认信号无入场价，不参与金额过滤（排序天然靠后）。
+    返回 (推荐列表, 排除品种列表[关联组去重], 跳过品种列表[资金约束])。
+    """
+    positions = positions or []
+    # 品种代码 → 关联组名（未配置的品种视为独立组）
+    group_map = {}
+    for g, codes in RISK_GROUPS_FUTURES.items():
+        for code in codes:
+            group_map[code] = g
+    cmeta = {c["code"]: c for c in contracts}
+
+    # ---- 汇总候选信号 ----
+    candidates = []
+    for code, sigs in signals.items():
+        c = cmeta.get(code)
+        if c is None:
+            continue
+        for sig in sigs:
+            if sig["status"] not in ("已确认", "待确认"):
+                continue
+            group = group_map.get(code)
+            candidates.append({
+                "code": code, "name": c["name"], "mult": c["mult"],
+                "margin": c["margin_actual"], "sig": sig,
+                "group": group if group else "独立品种(%s)" % c["name"],
+            })
+    # ---- 排序：强>温和；已确认>待确认；信号日早优先 ----
+    candidates.sort(key=lambda x: (0 if x["sig"]["strong"] else 1,
+                                   0 if x["sig"]["status"] == "已确认" else 1,
+                                   x["sig"]["signal_day"]))
+
+    # ---- 总保证金：已有持仓占用计入30%红线 ----
+    total_margin = sum(p["price"] * p["multiplier"] * p["lots"] * p["margin"]
+                       for p in positions)
+    used_groups = {}          # 组名 → 已入选品种名（用于展示排除原因）
+    recs, excluded, skipped = [], [], []
+    for cand in candidates:
+        sig = cand["sig"]
+        # ④ 关联组去重：同组只保留排序最靠前的一个
+        if cand["group"] in used_groups:
+            excluded.append("%s（%s，与%s同组）"
+                            % (cand["name"], cand["group"], used_groups[cand["group"]]))
+            continue
+        # ⑤ 资金约束过滤（仅已确认信号可计算金额）
+        if sig["status"] == "已确认":
+            lots = sig.get("lots", 0)
+            if lots < 1:
+                skipped.append("%s（资金不足开1手）" % cand["name"])
+                continue
+            margin_amt = sig["entry"] * cand["mult"] * cand["margin"] * lots
+            risk_amt = sig.get("risk_amt", 0.0)
+            if risk_amt > equity * RISK_PCT + 1e-9:
+                skipped.append("%s（单笔风险超%.1f%%）" % (cand["name"], RISK_PCT * 100))
+                continue
+            if margin_amt > equity * 0.20 + 1e-9:
+                skipped.append("%s（单品种保证金超20%%红线）" % cand["name"])
+                continue
+            if total_margin + margin_amt > equity * 0.30 + 1e-9:
+                skipped.append("%s（总保证金将超30%%红线）" % cand["name"])
+                continue
+            total_margin += margin_amt
+        reason = "%s趋势+%s+%s唯一入选" % (
+            "强" if sig["strong"] else "温和", sig["status"], cand["group"])
+        recs.append({
+            "name": cand["name"], "code": cand["code"],
+            "dir": "多" if sig["dir"] == 1 else "空",
+            "trend": "强" if sig["strong"] else "温和",
+            "status": sig["status"], "reason": reason,
+        })
+        used_groups[cand["group"]] = cand["name"]
+    return recs, excluded, skipped
 
 
 # =============================================================================
@@ -1415,8 +1514,29 @@ def render_app():
     else:
         st.write("最近%d个交易日内无新开仓信号。" % SIGNAL_LOOKBACK)
 
+    # 今日开仓推荐（只影响展示，不改变交易逻辑）
+    st.subheader("三、今日开仓推荐（按优先级排序，同关联组只选一个，已过滤资金约束）")
+    recs, excluded, skipped = build_recommendations_futures(
+        signals, contracts, equity, positions)
+    if recs:
+        df_recs = pd.DataFrame([{
+            "推荐顺序": i,
+            "品种": r["name"],
+            "方向": r["dir"],
+            "趋势": r["trend"],
+            "信号状态": r["status"],
+            "推荐理由": r["reason"],
+        } for i, r in enumerate(recs, 1)])
+        st.dataframe(df_recs, use_container_width=True, hide_index=True)
+    else:
+        st.write("今日无开仓推荐。")
+    for e in excluded:
+        st.warning("排除品种（关联组去重）：" + e)
+    for s in skipped:
+        st.warning("跳过品种（资金约束）：" + s)
+
     # 持仓监控结果
-    st.subheader("三、持仓监控结果")
+    st.subheader("四、持仓监控结果")
     if not pos_pairs:
         st.write("当前无持仓录入。")
     for p, res in pos_pairs:
@@ -1428,7 +1548,7 @@ def render_app():
                      % (p["name"], m_amt / equity * 100))
 
     # 资金占用与隔夜风险（硬约束汇总）
-    st.subheader("四、资金占用与隔夜风险（硬约束）")
+    st.subheader("五、资金占用与隔夜风险（硬约束）")
     total_margin = calc_total_margin(pos_pairs)
     total_pct = total_margin / equity * 100.0 if equity > 0 else 0.0
     c1, c2, c3 = st.columns(3)
@@ -1446,12 +1566,12 @@ def render_app():
         st.write("当前无持仓，无隔夜保证金占用。")
 
     # 次日条件单（可复制文本）
-    st.subheader("五、次日条件单（可复制）")
+    st.subheader("六、次日条件单（可复制）")
     st.text_area("次日条件单文本", value=build_orders_text(pos_pairs),
                  height=280, label_visibility="collapsed")
 
     # 数据获取统计
-    st.subheader("六、数据获取统计")
+    st.subheader("七、数据获取统计")
     cont_ok = sum(1 for c in contracts
                   if cont_dfs.get(c["code"]) is not None and len(cont_dfs[c["code"]]) >= DATA_MIN_BARS)
     main_ok = len(main_dfs)

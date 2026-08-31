@@ -68,6 +68,16 @@ ETF_POOL = [
     ("计算机ETF",   "159998"),
 ]
 
+# ---- 关联风险组（多品种开仓推荐时，同组只取1个；与命令行版一致） ----
+RISK_GROUPS_STOCK = {
+    "A500股票": ["STOCK"],                      # 全部A500成分股视为同一关联组
+    "消费ETF": ["159928"], "半导体ETF": ["512480"], "煤炭ETF": ["515220"],
+    "医药ETF": ["512010"], "新能源车ETF": ["515030"], "军工ETF": ["512660"],
+    "证券ETF": ["512880"], "银行ETF": ["512800"], "有色金属ETF": ["512400"],
+    "化工ETF": ["159870"], "白酒ETF": ["512690"], "农业ETF": ["159825"],
+    "通信ETF": ["515880"], "计算机ETF": ["159998"],
+}
+
 A500_INDEX = "000510"                 # 中证A500指数代码
 STOCK_STOP_PCT = 0.05                 # 股票默认百分比止损 5%（3%-5%区间内）
 ETF_STOP_PCT = 0.03                   # ETF默认百分比止损 3%（3%-5%区间内）
@@ -591,6 +601,90 @@ def filter_recent_signals_long(sigs, df):
         return []
     # sigs 按信号日升序生成，取最后一条即"最新信号"（同品种一天最多显示一条）
     return [out[-1]]
+
+
+# =============================================================================
+# 多品种开仓推荐（只影响展示，不改变任何交易逻辑；与命令行版一致）
+# =============================================================================
+
+
+def build_recommendations_stock(signal_entries, equity, positions=None):
+    """
+    今日开仓推荐（多品种同时满足开仓条件时的排序与过滤）：
+      排序：① 强趋势信号 > 温和趋势信号
+            ② 已确认信号 > 待确认信号
+            ③ 信号日更早 > 信号日更晚
+      过滤：④ 关联组去重：A500股票全组只选1个（按排序），各行业ETF各成一组互不排除
+            ⑤ 资金约束：单品种买入金额 ≤ 权益×20%；总买入金额 ≤ 权益×30%（含已有持仓）；
+               单笔风险 ≤ 权益×2%；资金不足开100股时跳过
+      说明：待确认信号无入场价，不参与金额过滤（排序天然靠后）。
+    返回 (推荐列表, 排除品种列表[关联组去重], 跳过品种列表[资金约束])。
+    """
+    positions = positions or []
+    # 构建ETF代码→组名映射（A500股票统一归入"A500股票"组）
+    etf_group_map = {}
+    for g, codes in RISK_GROUPS_STOCK.items():
+        for code in codes:
+            etf_group_map[code] = g
+
+    # ---- 汇总候选信号（信号过滤已保证每个标的最多一条信号） ----
+    candidates = []
+    for r in signal_entries:
+        for sig in r["sigs"]:
+            if sig["status"] not in ("已确认", "待确认"):
+                continue
+            if r["kind"] == "股票":
+                group = "A500股票"
+            else:
+                group = etf_group_map.get(r["code"], r["name"])
+            candidates.append({"entry": r, "sig": sig, "group": group})
+    # ---- 排序：强>温和；已确认>待确认；信号日早优先 ----
+    candidates.sort(key=lambda x: (0 if x["sig"]["strong"] else 1,
+                                   0 if x["sig"]["status"] == "已确认" else 1,
+                                   x["sig"]["signal_day"]))
+
+    # ---- 总买入金额：已有持仓占用计入30%红线 ----
+    total_amount = sum(p["price"] * p["shares"] for p in positions)
+    used_groups = {}          # 组名 → 已入选品种名（用于展示排除原因）
+    recs, excluded, skipped = [], [], []
+    for cand in candidates:
+        r, sig = cand["entry"], cand["sig"]
+        # ④ 关联组去重：同组只保留排序最靠前的一个
+        if cand["group"] in used_groups:
+            excluded.append("%s（%s，与%s同组）"
+                            % (r["name"], cand["group"], used_groups[cand["group"]]))
+            continue
+        # ⑤ 资金约束过滤（仅已确认信号可计算金额）
+        if sig["status"] == "已确认":
+            entry = sig["entry"]
+            stop_pct = r["stop_pct"]
+            shares_risk = int(equity * RISK_PCT / (entry * stop_pct)) // 100 * 100
+            shares_cap = int(equity * 0.20 / entry) // 100 * 100
+            shares = min(shares_risk, shares_cap)
+            if shares < 100:
+                skipped.append("%s（资金不足开100股）" % r["name"])
+                continue
+            buy_amount = shares * entry
+            risk_amt = shares * entry * stop_pct
+            if risk_amt > equity * RISK_PCT + 1e-9:
+                skipped.append("%s（单笔风险超%.1f%%）" % (r["name"], RISK_PCT * 100))
+                continue
+            if buy_amount > equity * 0.20 + 1e-9:
+                skipped.append("%s（买入金额超20%%红线）" % r["name"])
+                continue
+            if total_amount + buy_amount > equity * 0.30 + 1e-9:
+                skipped.append("%s（总买入金额将超30%%红线）" % r["name"])
+                continue
+            total_amount += buy_amount
+        reason = "%s趋势+%s+%s唯一入选" % (
+            "强" if sig["strong"] else "温和", sig["status"], cand["group"])
+        recs.append({
+            "code": r["code"], "name": r["name"], "kind": r["kind"],
+            "trend": "强" if sig["strong"] else "温和",
+            "status": sig["status"], "reason": reason,
+        })
+        used_groups[cand["group"]] = r["name"]
+    return recs, excluded, skipped
 
 
 # =============================================================================
@@ -1134,8 +1228,32 @@ def render_app():
     else:
         st.write("最近%d个交易日内无新开仓信号。" % SIGNAL_LOOKBACK)
 
+    # 多品种开仓推荐（排序+关联组去重+资金约束；只影响展示）
+    st.subheader("四、今日开仓推荐（多品种同时满足开仓条件时：强>温和，已确认>待确认，"
+                 "信号日早者优先；同组只取1个）")
+    recs, excluded, skipped = build_recommendations_stock(signals, equity, positions)
+    if recs:
+        rec_rows = []
+        for i, r in enumerate(recs, 1):
+            rec_rows.append({
+                "推荐顺序": i,
+                "代码": r["code"],
+                "名称": r["name"],
+                "类型": r["kind"],
+                "趋势": r["trend"],
+                "信号状态": r["status"],
+                "推荐理由": r["reason"],
+            })
+        st.dataframe(pd.DataFrame(rec_rows), use_container_width=True, hide_index=True)
+    else:
+        st.write("无（今日无满足条件的开仓信号）")
+    for e in excluded:
+        st.warning("排除品种（关联组去重）：" + e)
+    for s in skipped:
+        st.warning("跳过品种（资金约束）：" + s)
+
     # 持仓监控结果
-    st.subheader("四、持仓监控结果")
+    st.subheader("五、持仓监控结果")
     if not pos_pairs:
         st.write("当前无持仓录入。")
     for p, res in pos_pairs:
@@ -1147,7 +1265,7 @@ def render_app():
                      % (p["name"], buy_amt / equity * 100))
 
     # 资金占用与总仓位（硬约束汇总）
-    st.subheader("五、资金占用与总仓位（硬约束）")
+    st.subheader("六、资金占用与总仓位（硬约束）")
     total_amount = calc_total_amount(pos_pairs)
     total_pct = total_amount / equity * 100.0 if equity > 0 else 0.0
     c1, c2, c3 = st.columns(3)
@@ -1165,12 +1283,12 @@ def render_app():
         st.write("当前无持仓，无总仓位占用。")
 
     # 次日条件单（可复制文本）
-    st.subheader("六、次日条件单（可复制）")
+    st.subheader("七、次日条件单（可复制）")
     st.text_area("次日条件单文本", value=build_orders_text_stock(pos_pairs),
                  height=240, label_visibility="collapsed")
 
     # 数据获取统计
-    st.subheader("七、数据获取统计")
+    st.subheader("八、数据获取统计")
     ok_cnt = sum(1 for item in pool if item["code"] in prepared)
     st.markdown(
         "**数据源**：新浪优先（股票 stock_zh_a_daily 前复权qfq；ETF fund_etf_hist_sina 不复权），"
